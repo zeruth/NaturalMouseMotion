@@ -3,7 +3,9 @@ package com.github.joonasvali.naturalmouse.api;
 import com.github.joonasvali.naturalmouse.support.DoublePoint;
 import com.github.joonasvali.naturalmouse.support.Flow;
 import com.github.joonasvali.naturalmouse.support.MouseMotionNature;
-import com.github.joonasvali.naturalmouse.util.Pair;
+import com.github.joonasvali.naturalmouse.support.mousemotion.Movement;
+import com.github.joonasvali.naturalmouse.support.mousemotion.MovementFactory;
+import com.github.joonasvali.naturalmouse.util.MathUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,6 +20,7 @@ import java.util.Random;
  */
 public class MouseMotion {
   private static final Logger log = LoggerFactory.getLogger(MouseMotion.class);
+  private static final int SLEEP_AFTER_ADJUSTMENT_MS = 2;
   private final int minSteps;
   private final int effectFadeSteps;
   private final int reactionTimeBaseMs;
@@ -79,15 +82,17 @@ public class MouseMotion {
     updateMouseInfo();
     log.info("Starting to move mouse to ({}, {}), current position: ({}, {})", xDest, yDest, mousePosition.x, mousePosition.y);
 
-    ArrayDeque<Movement> movements = createMovements();
+    MovementFactory movementFactory = new MovementFactory(xDest, yDest, speedManager, overshootManager, screenSize);
+    ArrayDeque<Movement> movements = movementFactory.createMovements(mousePosition);
     int overshoots = movements.size() - 1;
     while (mousePosition.x != xDest || mousePosition.y != yDest) {
       if (movements.isEmpty()) {
         // This shouldn't usually happen, but it's possible that somehow we won't end up on the target,
-        // Then just re-attempt from mouse new position.
+        // Then just re-attempt from mouse new position. (There are known JDK bugs, that can cause sending the cursor
+        // to wrong pixel)
         updateMouseInfo();
-        log.debug("Populating movement array.");
-        movements = createMovements();
+        log.warn("Re-populating movement array. Did not end up on target pixel.");
+        movements = movementFactory.createMovements(mousePosition);
       }
 
       Movement movement = movements.removeFirst();
@@ -101,7 +106,7 @@ public class MouseMotion {
       Flow flow = movement.flow;
       double xDistance = movement.xDistance;
       double yDistance = movement.yDistance;
-      log.debug("Movement arc length computed to {} and time predicted to {} ms", (int) distance, mouseMovementMs);
+      log.debug("Movement arc length computed to {} and time predicted to {} ms", distance, mouseMovementMs);
 
       /* Number of steps is calculated from the movement time and limited by minimal amount of steps
          (should have at least MIN_STEPS) and distance (shouldn't have more steps than pixels travelled) */
@@ -136,7 +141,7 @@ public class MouseMotion {
 
         completedXDistance += xStepSize;
         completedYDistance += yStepSize;
-        double completedDistance = Math.sqrt(Math.pow(completedXDistance, 2) + Math.pow(completedYDistance, 2));
+        double completedDistance = Math.hypot(completedXDistance, completedYDistance);
         double completion = Math.min(1, completedDistance / distance);
         log.trace("Step: x: {} y: {} tc: {} c: {}", xStepSize, yStepSize, timeCompletion, completion);
 
@@ -148,13 +153,23 @@ public class MouseMotion {
         simulatedMouseX += xStepSize;
         simulatedMouseY += yStepSize;
 
+        log.trace("EffectFadeMultiplier: {}", effectFadeMultiplier);
+        log.trace("SimulatedMouse: [{}, {}]", simulatedMouseX, simulatedMouseY);
+
         long endTime = startTime + stepTime * (i + 1);
-        int mousePosX = (int) Math.round(simulatedMouseX +
+        int mousePosX = MathUtil.roundTowards(
+            simulatedMouseX +
             deviation.getX() * deviationMultiplierX * effectFadeMultiplier +
-            noiseX * effectFadeMultiplier);
-        int mousePosY = (int) Math.round(simulatedMouseY +
+            noiseX * effectFadeMultiplier,
+            movement.destX
+        );
+
+        int mousePosY = MathUtil.roundTowards(
+            simulatedMouseY +
             deviation.getY() * deviationMultiplierY * effectFadeMultiplier +
-            noiseY * effectFadeMultiplier);
+            noiseY * effectFadeMultiplier,
+            movement.destY
+        );
 
         mousePosX = limitByScreenWidth(mousePosX);
         mousePosY = limitByScreenHeight(mousePosY);
@@ -171,59 +186,28 @@ public class MouseMotion {
         sleepAround(Math.max(timeLeft, 0), 0);
       }
       updateMouseInfo();
+
       if (mousePosition.x != movement.destX || mousePosition.y != movement.destY) {
+        // It's possible that mouse is manually moved or for some other reason.
+        // Let's start next step from pre-calculated location to prevent errors from accumulating.
+        // But print warning as this is not expected behavior.
+        log.warn("Mouse off from step endpoint (adjustment was done) " +
+            "x: (" + mousePosition.x + " -> " + movement.destX + ") " +
+            "y: (" + mousePosition.y + " -> " + movement.destY + ") "
+        );
+        systemCalls.setMousePosition(movement.destX, movement.destY);
+        // Let's wait a bit before getting mouse info.
+        sleepAround(SLEEP_AFTER_ADJUSTMENT_MS, 0);
+        updateMouseInfo();
+      }
+
+      if (mousePosition.x != xDest || mousePosition.y != yDest) {
+        // We are dealing with overshoot, let's sleep a bit to simulate human reaction time.
         sleepAround(reactionTimeBaseMs, reactionTimeVariationMs);
       }
       log.debug("Steps completed, mouse at " + mousePosition.x + " " + mousePosition.y);
     }
     log.info("Mouse movement to ({}, {}) completed", xDest, yDest);
-  }
-
-  private ArrayDeque<Movement> createMovements() {
-    ArrayDeque<Movement> movements = new ArrayDeque<>();
-    int lastMousePositionX = mousePosition.x;
-    int lastMousePositionY = mousePosition.y;
-    int xDistance = xDest - lastMousePositionX;
-    int yDistance = yDest - lastMousePositionY;
-
-    double initialDistance = Math.sqrt(Math.pow(xDistance, 2) + Math.pow(yDistance, 2));
-    Pair<Flow, Long> flowTime = speedManager.getFlowWithTime(initialDistance);
-    Flow flow = flowTime.x;
-    long mouseMovementMs = flowTime.y;
-    int overshoots = overshootManager.getOvershoots(flow, mouseMovementMs, initialDistance);
-
-    if (overshoots == 0) {
-      movements.add(new Movement(xDest, yDest, initialDistance, xDistance, yDistance, mouseMovementMs, flow));
-      return movements;
-    }
-
-    for (int i = overshoots; i > 0; i--) {
-      Point overshoot = overshootManager.getOvershootAmount(
-          xDest - lastMousePositionX, yDest - lastMousePositionY, mouseMovementMs, i
-      );
-      int currentDestinationX = limitByScreenWidth(xDest + overshoot.x);
-      int currentDestinationY = limitByScreenHeight(yDest + overshoot.y);
-      xDistance = currentDestinationX - lastMousePositionX;
-      yDistance = currentDestinationY - lastMousePositionY;
-      double distance = Math.sqrt(Math.pow(xDistance, 2) + Math.pow(yDistance, 2));
-      flow = speedManager.getFlowWithTime(distance).x;
-      movements.add(
-          new Movement(currentDestinationX, currentDestinationY, distance, xDistance, yDistance, mouseMovementMs, flow)
-      );
-      lastMousePositionX = currentDestinationX;
-      lastMousePositionY = currentDestinationY;
-      // Apply for the next overshoot if exists.
-      mouseMovementMs = overshootManager.deriveNextMouseMovementTimeMs(mouseMovementMs, i - 1);
-    }
-
-    xDistance = xDest - lastMousePositionX;
-    yDistance = yDest - lastMousePositionY;
-    double distance = Math.sqrt(Math.pow(xDistance, 2) + Math.pow(yDistance, 2));
-    movements.add(
-        new Movement(xDest, yDest, distance, xDistance, yDistance, mouseMovementMs, flow)
-    );
-
-    return movements;
   }
 
   private int limitByScreenWidth(int value) {
@@ -247,23 +231,4 @@ public class MouseMotion {
     mousePosition = mouseInfo.getMousePosition();
   }
 
-  private static class Movement {
-    private final int destX;
-    private final int destY;
-    private final double distance;
-    private final double xDistance;
-    private final double yDistance;
-    private final long time;
-    private final Flow flow;
-
-    public Movement(int destX, int destY, double distance, double xDistance, double yDistance, long time, Flow flow) {
-      this.destX = destX;
-      this.destY = destY;
-      this.distance = distance;
-      this.xDistance = xDistance;
-      this.yDistance = yDistance;
-      this.time = time;
-      this.flow = flow;
-    }
-  }
 }
